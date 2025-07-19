@@ -9,7 +9,7 @@ external_components:
   - source:
       type: git
       url: https://github.com/Reubertt/esphome-components
-    components: [volume-sensor]
+    components: [volume_sensor]
     #refresh: 1h
 
 # Enable logging

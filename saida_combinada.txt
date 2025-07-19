@@ -1,0 +1,337 @@
+// configurations/volume-sensor.yaml
+esphome:
+  name: volume-sensor
+  friendly_name: Volume-Sensor
+
+esp8266:
+  board: nodemcuv2
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/Reubertt/esphome-components
+    components: [volume-sensor]
+    #refresh: 1h
+
+# Enable logging
+#logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret apikey
+
+ota:
+  - platform: esphome
+    password: !secret ota
+
+# This automation is CRUCIAL for stability.
+# It starts sampling slowly, then speeds up after Wi-Fi connects.
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "volume-sensor Fallback Hotspot"
+    password: !secret wifi_password
+
+  on_connect:
+    then:
+      - logger.log: "WiFi connected. Starting fast sampling."
+      - component.resume:
+          id: volume_sensor_main
+          # This sets the high-frequency sampling rate.
+          update_interval: 50ms
+
+captive_portal:
+
+
+sensor:
+  - platform: volume_sensor
+    id: volume_sensor_main
+    internal: true # The main component is just a controller.
+    pin: A0
+
+    # Start with a very long interval to allow Wi-Fi to connect reliably.
+    # The 'on_connect' automation above will override this.
+    update_interval: 100s
+
+    # Publish the peak value found every 5 seconds.
+    publish_interval: 5s
+
+    # Each sample burst lasts 30ms. The next burst starts immediately.
+    sampling_duration: 30ms
+
+    # --- Measurement Configuration ---
+    sensitivity: 50
+    # Use calibration to narrow the focus to your sensor's actual operating range,
+    # determined after completing the hardware calibration in Step 1.
+    adc_min_calibration: 200
+    adc_max_calibration: 900
+
+    # --- Child Sensors ---
+    db_sensor:
+      name: "Volume DB"
+
+    raw_max_sensor:
+      name: "Raw ADC Max"
+
+    raw_min_sensor:
+      name: "Raw ADC Min"
+
+    percentage_sensor:
+      name: "Volume Percent"
+
+number:
+  - platform: template
+    name: "Sound Sensitivity"
+    optimistic: true
+    initial_value: 50
+    min_value: 0.0
+    max_value: 100.0
+    step: 0.5
+    set_action:
+      - lambda: id(volume_sensor_main).set_sensitivity(x);
+
+// components/volume_sensor/volume_sensor.h
+#pragma once
+#include "esphome/components/sensor/sensor.h"
+#include "esphome/core/component.h"
+
+namespace esphome {
+namespace volume_sensor {
+
+class VolumeSensor : public sensor::Sensor, public PollingComponent {
+public:
+  void set_pin(uint8_t pin) { this->pin_ = pin; }
+  void set_sampling_duration(uint32_t duration) { this->sampling_duration_ = duration; }
+  void set_publish_interval(uint32_t interval) { this->publish_interval_ = interval; }
+  void set_sensitivity(float sensitivity) { this->sensitivity_ = sensitivity; }
+  void set_adc_min_calibration(uint16_t val) { this->adc_min_cal_ = val; }
+  void set_adc_max_calibration(uint16_t val) { this->adc_max_cal_ = val; }
+  void set_db_sensor(sensor::Sensor *sensor) { this->db_sensor_ = sensor; }
+  void set_raw_max_sensor(sensor::Sensor *sensor) { this->raw_max_sensor_ = sensor; }
+  void set_raw_min_sensor(sensor::Sensor *sensor) { this->raw_min_sensor_ = sensor; }
+  void set_percentage_sensor(sensor::Sensor *sensor) { this->percentage_sensor_ = sensor; }
+
+  void update() override;
+  void dump_config() override;
+
+protected:
+  float map_value_float(float x, float in_min, float in_max, float out_min,
+                        float out_max);
+
+  uint8_t pin_;
+  uint32_t sampling_duration_;
+  uint32_t publish_interval_;
+  float sensitivity_;
+  int16_t adc_min_cal_{-1};
+  int16_t adc_max_cal_{-1};
+
+  sensor::Sensor *raw_max_sensor_{nullptr};
+  sensor::Sensor *raw_min_sensor_{nullptr};
+  sensor::Sensor *percentage_sensor_{nullptr};
+  sensor::Sensor *db_sensor_{nullptr};
+
+  uint32_t last_publish_time_{0};
+  uint16_t max_amplitude_in_window_{0};
+
+  uint16_t peak_signal_max_in_window_{0};
+  uint16_t peak_signal_min_in_window_{1023};
+};
+
+} // namespace volume_sensor
+} // namespace esphome
+
+// components/volume_sensor/volume_sensor.cpp
+#include "volume_sensor.h"
+#include "esphome/core/log.h"
+#include <algorithm>
+#include <cmath>
+
+namespace esphome {
+namespace volume_sensor {
+
+static const char *const TAG = "volume_sensor.sensor";
+
+float VolumeSensor::map_value_float(float x, float in_min, float in_max,
+                                    float out_min, float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+void VolumeSensor::dump_config() {
+  LOG_SENSOR("", "Volume Sensor", this);
+  ESP_LOGCONFIG(TAG, "  Pin: %u", this->pin_);
+  ESP_LOGCONFIG(TAG, "  Sampling Duration: %ums", this->sampling_duration_);
+  ESP_LOGCONFIG(TAG, "  Publish Interval: %ums", this->publish_interval_);
+  ESP_LOGCONFIG(TAG, "  Sensitivity: %.2f", this->sensitivity_);
+  if (this->adc_min_cal_ != -1) {
+    ESP_LOGCONFIG(
+        TAG, "  Mode: Calibrated Range (ADC: %d-%d), adjusted by Sensitivity",
+        this->adc_min_cal_, this->adc_max_cal_);
+  } else {
+    ESP_LOGCONFIG(TAG,
+                  "  Mode: Dynamic Range (0-1023), adjusted by Sensitivity");
+  }
+  LOG_SENSOR("  ", "Raw Max Sensor", this->raw_max_sensor_);
+  LOG_SENSOR("  ", "Raw Min Sensor", this->raw_min_sensor_);
+  LOG_SENSOR("  ", "Percentage Sensor", this->percentage_sensor_);
+  LOG_SENSOR("  ", "DB Sensor", this->db_sensor_);
+}
+
+void VolumeSensor::update() {
+  uint16_t signal_max = 0;
+  uint16_t signal_min = 1023;
+  unsigned long start_time = millis();
+  while (millis() - start_time < this->sampling_duration_) {
+    uint16_t sample = analogRead(this->pin_);
+    signal_max = std::max(signal_max, sample);
+    signal_min = std::min(signal_min, sample);
+  }
+  uint16_t current_amplitude = signal_max - signal_min;
+
+  if (current_amplitude > this->max_amplitude_in_window_) {
+    this->max_amplitude_in_window_ = current_amplitude;
+    this->peak_signal_max_in_window_ = signal_max;
+    this->peak_signal_min_in_window_ = signal_min;
+  }
+
+  unsigned long now = millis();
+  if (now - this->last_publish_time_ < this->publish_interval_) {
+    return;
+  }
+
+  this->last_publish_time_ = now;
+  uint16_t peak_amplitude = this->max_amplitude_in_window_;
+
+  if (this->raw_max_sensor_ != nullptr) {
+    this->raw_max_sensor_->publish_state(this->peak_signal_max_in_window_);
+  }
+  if (this->raw_min_sensor_ != nullptr) {
+    this->raw_min_sensor_->publish_state(this->peak_signal_min_in_window_);
+  }
+
+  float base_min = 0.0f;
+  float base_max = 1023.0f;
+  if (this->adc_min_cal_ != -1 && this->adc_max_cal_ != -1) {
+    base_min = this->adc_min_cal_;
+    base_max = this->adc_max_cal_;
+  }
+  const float MIN_SENSITIVITY = 10.0f;
+  const float MAX_SENSITIVITY = 100.0f;
+  const float MIN_RANGE_SPAN = 1.0f;
+  float final_max = this->map_value_float(this->sensitivity_, MIN_SENSITIVITY,
+                                          MAX_SENSITIVITY, base_max,
+                                          base_min + MIN_RANGE_SPAN);
+  final_max = std::max(base_min + MIN_RANGE_SPAN, final_max);
+  float final_range = final_max - base_min;
+  if (final_range <= 0)
+    final_range = 1.0f;
+  int adjusted_amplitude = peak_amplitude;
+
+  if (this->percentage_sensor_ != nullptr) {
+    float percentage =
+        this->map_value_float(adjusted_amplitude, 0, final_range, 0.0, 100.0);
+    percentage = std::max(0.0f, std::min(100.0f, percentage));
+    this->percentage_sensor_->publish_state(percentage);
+  }
+  if (this->db_sensor_ != nullptr || !this->is_internal()) {
+    float mapped_amplitude =
+        this->map_value_float(adjusted_amplitude, 0, final_range, 1.5, 1023.0);
+    if (mapped_amplitude <= 0)
+      mapped_amplitude = 1.0;
+    float db_value = 36.5f * log10f(mapped_amplitude);
+    if (this->db_sensor_ != nullptr) {
+      this->db_sensor_->publish_state(db_value);
+    } else {
+      this->publish_state(db_value);
+    }
+  }
+
+  this->max_amplitude_in_window_ = 0;
+  this->peak_signal_max_in_window_ = 0;
+  this->peak_signal_min_in_window_ = 1023;
+}
+
+} // namespace volume_sensor
+} // namespace esphome
+
+// components/volume_sensor/sensor.py
+import esphome.codegen as cg
+import esphome.config_validation as cv
+from esphome.components import sensor
+from esphome.const import CONF_ID, CONF_PIN, CONF_SENSITIVITY, CONF_NAME
+
+CONF_SAMPLING_DURATION = "sampling_duration"
+CONF_PUBLISH_INTERVAL = "publish_interval"
+CONF_ADC_MIN_CALIBRATION = "adc_min_calibration"
+CONF_ADC_MAX_CALIBRATION = "adc_max_calibration"
+CONF_RAW_MAX_SENSOR = "raw_max_sensor"
+CONF_RAW_MIN_SENSOR = "raw_min_sensor"
+CONF_PERCENTAGE_SENSOR = "percentage_sensor"
+CONF_DB_SENSOR = "db_sensor"
+
+volume_sensor_ns = cg.esphome_ns.namespace("volume_sensor")
+VolumeSensor = volume_sensor_ns.class_("VolumeSensor", sensor.Sensor, cg.PollingComponent)
+
+CONFIG_SCHEMA = sensor.sensor_schema(VolumeSensor).extend({
+    cv.GenerateID(): cv.declare_id(VolumeSensor),
+    cv.Required(CONF_PIN): cv.string,
+    cv.Optional(CONF_SAMPLING_DURATION, default="20ms"): cv.positive_time_period_milliseconds,
+    cv.Optional(CONF_PUBLISH_INTERVAL, default="5s"): cv.positive_time_period_milliseconds,
+    cv.Optional(CONF_SENSITIVITY, default=50): cv.float_,
+    cv.Optional(CONF_ADC_MIN_CALIBRATION): cv.int_range(min=0, max=1023),
+    cv.Optional(CONF_ADC_MAX_CALIBRATION): cv.int_range(min=0, max=1023),
+    cv.Optional(CONF_RAW_MAX_SENSOR): sensor.sensor_schema(
+        unit_of_measurement="adc",
+        icon="mdi:arrow-up-box",
+        accuracy_decimals=0,
+    ),
+    cv.Optional(CONF_RAW_MIN_SENSOR): sensor.sensor_schema(
+        unit_of_measurement="adc",
+        icon="mdi:arrow-down-box",
+        accuracy_decimals=0,
+        ),
+    cv.Optional(CONF_PERCENTAGE_SENSOR): sensor.sensor_schema(
+        unit_of_measurement="%",
+        icon="mdi:volume-high",
+        accuracy_decimals=0,
+    ),
+    cv.Optional(CONF_DB_SENSOR): sensor.sensor_schema(
+        unit_of_measurement="dB",
+        icon="mdi:waveform",
+        accuracy_decimals=1,
+    ),
+}).extend(cv.polling_component_schema("100s"))
+
+async def to_code(config):
+    var = cg.new_Pvariable(config[CONF_ID])
+    await cg.register_component(var, config)
+
+    cg.add(var.set_pin(cg.RawExpression(config[CONF_PIN])))
+    cg.add(var.set_sensitivity(config[CONF_SENSITIVITY]))
+    cg.add(var.set_sampling_duration(config[CONF_SAMPLING_DURATION]))
+    cg.add(var.set_publish_interval(config[CONF_PUBLISH_INTERVAL]))
+
+    if CONF_ADC_MIN_CALIBRATION in config:
+        cg.add(var.set_adc_min_calibration(config[CONF_ADC_MIN_CALIBRATION]))
+    if CONF_ADC_MAX_CALIBRATION in config:
+        cg.add(var.set_adc_max_calibration(config[CONF_ADC_MAX_CALIBRATION]))
+
+    if raw_max_config := config.get(CONF_RAW_MAX_SENSOR):
+        sens = await sensor.new_sensor(raw_max_config)
+        cg.add(var.set_raw_max_sensor(sens))
+    if raw_min_config := config.get(CONF_RAW_MIN_SENSOR):
+        sens = await sensor.new_sensor(raw_min_config)
+        cg.add(var.set_raw_min_sensor(sens))
+    if percentage_config := config.get(CONF_PERCENTAGE_SENSOR):
+        sens = await sensor.new_sensor(percentage_config)
+        cg.add(var.set_percentage_sensor(sens))
+
+    if db_config := config.get(CONF_DB_SENSOR):
+        sens = await sensor.new_sensor(db_config)
+        cg.add(var.set_db_sensor(sens))
+    elif CONF_NAME in config:
+        await sensor.register_sensor(var, config)
+
