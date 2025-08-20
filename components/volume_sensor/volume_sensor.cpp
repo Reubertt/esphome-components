@@ -34,6 +34,10 @@ void VolumeSensor::dump_config() {
 }
 
 void VolumeSensor::update() {
+  // Set ADC resolution to 10 bits (0-1023) on ESP32
+  #if defined(ESP32)
+    analogReadResolution(10);
+  #endif
   uint16_t signal_max = 0;
   uint16_t signal_min = 1023;
   unsigned long start_time = millis();
