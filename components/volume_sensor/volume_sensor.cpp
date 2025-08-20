@@ -13,6 +13,15 @@ float VolumeSensor::map_value_float(float x, float in_min, float in_max,
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
+void VolumeSensor::setup() {
+  #if defined(ESP32)
+    // Set attenuation to 0db to be as close to esp8266 as possible
+    analogSetPinAttenuation(this->pin_, ADC_0db);
+    // Set ADC resolution to 10 bits (0-1023) on ESP32
+    analogReadResolution(10);
+  #endif
+}
+
 void VolumeSensor::dump_config() {
   LOG_SENSOR("", "Volume Sensor", this);
   ESP_LOGCONFIG(TAG, "  Pin: %u", this->pin_);
@@ -34,10 +43,6 @@ void VolumeSensor::dump_config() {
 }
 
 void VolumeSensor::update() {
-  // Set ADC resolution to 10 bits (0-1023) on ESP32
-  #if defined(ESP32)
-    analogReadResolution(10);
-  #endif
   uint16_t signal_max = 0;
   uint16_t signal_min = 1023;
   unsigned long start_time = millis();
