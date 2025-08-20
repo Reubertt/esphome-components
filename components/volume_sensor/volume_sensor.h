@@ -19,6 +19,7 @@ public:
   void set_percentage_sensor(sensor::Sensor *sensor) { this->percentage_sensor_ = sensor; }
 
   void update() override;
+  void setup() override;
   void dump_config() override;
 
 protected:
